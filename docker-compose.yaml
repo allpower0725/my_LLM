@@ -1,0 +1,195 @@
+services:
+  traefik:
+    container_name: traefik
+    image: "traefik"
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
+      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL}"
+      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_data:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ngrok
+    network_mode: "host"            # 對應 --net=host
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    command: ["http", "--url=${NGROK_STATIC_DOMIN}", "5678"]
+    restart: unless-stopped
+    stdin_open: true                # 對應 -it 的互動 stdin
+    tty: true                       # 對應 -it 的 tty
+  ollama:
+    container_name: ollama
+    image: ollama/ollama:${OLLAMA_DOCKER_TAG:-latest}
+    restart: unless-stopped
+    tty: true
+    ports:
+    - ${OLLAMA_WEBAPI_PORT:-11434}:11434
+    environment:
+    - OLLAMA_HOST=0.0.0.0
+    volumes:
+    - ollama:/root/.ollama
+    networks:
+    - app_net
+    pull_policy: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # 可用數字 (例如 1) 或 "all"。不設定 count 預設為 all。
+              count: all
+              capabilities: [gpu]
+    # healthcheck:
+    #   test: ["CMD-SHELL", "curl -f http://localhost:11434/ || exit 1"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3   
+  tika:
+    container_name: tika
+    image: apache/tika:latest
+    # Override default so we can add configuration on classpath
+    entrypoint: [ "/bin/sh", "-c", "exec java -cp \"/customocr:/tika-server-standard-$${TIKA_VERSION}.jar:/tika-extras/*\" org.apache.tika.server.core.TikaServerCli -h 0.0.0.0 $$0 $$@"]
+    # Kept command as example but could be added to entrypoint too
+    command: -c /tika-config.xml
+    restart: on-failure
+    ports:
+      - "9998:9998"
+    volumes:
+      # Choose the configuration you want, or add your own custom one
+      # -  ./sample-configs/customocr/tika-config-inline.xml:/tika-config.xml
+      -  ./sample-configs/customocr/tika-config-rendered.xml:/tika-config.xml
+    networks:
+    - app_net
+  open-webui:
+    container_name: webui
+    build:
+      context: .
+      args:
+        OLLAMA_BASE_URL: /ollama
+      dockerfile: Dockerfile
+    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG:-main}
+    restart: unless-stopped
+    ports:
+    - ${OPEN_WEBUI_PORT:-3000}:8080
+    depends_on:
+    - ollama
+    environment:
+    - OLLAMA_BASE_URL=http://ollama:11434
+    - WEBUI_SECRET_KEY=n802fwu6LdIedfTXmoSexLwuxGk2n7efbNe8C8xJR9pKaINOYpy/xrtzbGS9TXWxaP25vq5+cFdimQFffObnRg==
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    volumes:
+    - open-webui:/app/backend/data
+    networks:
+    - app_net
+    # healthcheck:
+    #   test: ["CMD-SHELL", "curl -f http://localhost:8080/ || exit 1"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+  postgres:
+    container_name: postgres
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - 5432:5432
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+    - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+    - app_net
+    # healthcheck:
+    #   test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+  pgadmin:
+    container_name: pgadmin
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-changeme}
+    ports:
+      - 5433:80
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - app_net
+    depends_on:
+      - postgres
+  n8n:
+    container_name: n8n
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+    - 127.0.0.1:5678:5678
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    depends_on:
+    - postgres
+    labels:
+    - traefik.enable=true
+    # - traefik.http.routers.n8n.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
+    - traefik.http.routers.n8n.rule=Host(`n8n.localhost`)
+    - traefik.http.routers.n8n.tls=true
+    - traefik.http.routers.n8n.entrypoints=web,websecure
+    - traefik.http.routers.n8n.tls.certresolver=mytlschallenge
+    - traefik.http.middlewares.n8n.headers.SSLRedirect=true
+    - traefik.http.middlewares.n8n.headers.STSSeconds=315360000
+    - traefik.http.middlewares.n8n.headers.browserXSSFilter=true
+    - traefik.http.middlewares.n8n.headers.contentTypeNosniff=true
+    - traefik.http.middlewares.n8n.headers.forceSTSHeader=true
+    # - traefik.http.middlewares.n8n.headers.SSLHost=${DOMAIN_NAME}
+    - traefik.http.middlewares.n8n.headers.STSIncludeSubdomains=true
+    - traefik.http.middlewares.n8n.headers.STSPreload=true
+    - traefik.http.routers.n8n.middlewares=n8n@docker
+    environment:
+    - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+    # - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
+    - N8N_HOST=0.0.0.0
+    - N8N_PORT=5678
+    - N8N_PROTOCOL=https
+    - N8N_RUNNERS_ENABLED=true
+    - NODE_ENV=production
+    # - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
+    - WEBHOOK_URL=https://${NGROK_STATIC_DOMIN}/
+    - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+    - TZ=${GENERIC_TIMEZONE}
+    volumes:
+    - n8n_data:/home/node/.n8n
+    - ./local-files:/files
+    networks:
+    - app_net
+    # healthcheck:
+    #   test: ["CMD-SHELL", "curl -f http://localhost:5678/ || exit 1"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+volumes:
+  n8n_data: {}
+  postgres_data: {}
+  traefik_data: {}
+  ollama: {}
+  open-webui: {}
+  pgadmin_data: {}
+networks:
+  app_net:
+    driver: bridge
